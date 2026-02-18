@@ -1,17 +1,24 @@
 /**
  * NanoClaw Agent Runner
- * Runs inside a container, receives config via stdin, outputs result to stdout
+ * Runs as a child process, receives config via stdin, outputs result to stdout
  *
  * Input protocol:
- *   Stdin: Full ContainerInput JSON (read until EOF, like before)
- *   IPC:   Follow-up messages written as JSON files to /workspace/ipc/input/
+ *   Stdin: Full ContainerInput JSON (read until EOF)
+ *   IPC:   Follow-up messages written as JSON files to IPC_INPUT_DIR
  *          Files: {type:"message", text:"..."}.json — polled and consumed
- *          Sentinel: /workspace/ipc/input/_close — signals session end
+ *          Sentinel: IPC_INPUT_DIR/_close — signals session end
  *
  * Stdout protocol:
  *   Each result is wrapped in OUTPUT_START_MARKER / OUTPUT_END_MARKER pairs.
  *   Multiple results may be emitted (one per agent teams result).
  *   Final marker after loop ends signals completion.
+ *
+ * Environment variables for paths (set by the host runner):
+ *   NANOCLAW_IPC_DIR      — base IPC directory for this group
+ *   NANOCLAW_GROUP_DIR    — working directory for the agent (group folder)
+ *   NANOCLAW_GLOBAL_DIR   — path to global CLAUDE.md directory
+ *   NANOCLAW_EXTRA_DIRS   — colon-separated additional directories
+ *   NANOCLAW_SESSIONS_DIR — path to .claude sessions directory
  */
 
 import fs from 'fs';
@@ -34,6 +41,7 @@ interface ContainerOutput {
   result: string | null;
   newSessionId?: string;
   error?: string;
+  isPartial?: boolean;
 }
 
 interface SessionEntry {
@@ -54,9 +62,15 @@ interface SDKUserMessage {
   session_id: string;
 }
 
-const IPC_INPUT_DIR = '/workspace/ipc/input';
+// Paths from environment variables (set by host runner), with container defaults for backwards compat
+const IPC_BASE_DIR = process.env.NANOCLAW_IPC_DIR || '/workspace/ipc';
+// Input dir can be JID-specific (set by host) to prevent cross-contamination
+const IPC_INPUT_DIR = process.env.NANOCLAW_IPC_INPUT_DIR || path.join(IPC_BASE_DIR, 'input');
 const IPC_INPUT_CLOSE_SENTINEL = path.join(IPC_INPUT_DIR, '_close');
 const IPC_POLL_MS = 500;
+const GROUP_DIR = process.env.NANOCLAW_GROUP_DIR || '/workspace/group';
+const GLOBAL_DIR = process.env.NANOCLAW_GLOBAL_DIR || '/workspace/global';
+const EXTRA_DIRS_ENV = process.env.NANOCLAW_EXTRA_DIRS || '';
 
 /**
  * Push-based async iterable for streaming user messages to the SDK.
@@ -165,7 +179,7 @@ function createPreCompactHook(): HookCallback {
       const summary = getSessionSummary(sessionId, transcriptPath);
       const name = summary ? sanitizeFilename(summary) : generateFallbackName();
 
-      const conversationsDir = '/workspace/group/conversations';
+      const conversationsDir = path.join(GROUP_DIR, 'conversations');
       fs.mkdirSync(conversationsDir, { recursive: true });
 
       const date = new Date().toISOString().split('T')[0];
@@ -390,22 +404,24 @@ async function runQuery(
   let messageCount = 0;
   let resultCount = 0;
 
+  // Streaming state: accumulate text deltas and emit periodically
+  let streamingText = '';
+  let lastStreamEmit = 0;
+  let isStreamingTextBlock = false;
+
   // Load global CLAUDE.md as additional system context (shared across all groups)
-  const globalClaudeMdPath = '/workspace/global/CLAUDE.md';
+  const globalClaudeMdPath = path.join(GLOBAL_DIR, 'CLAUDE.md');
   let globalClaudeMd: string | undefined;
   if (!containerInput.isMain && fs.existsSync(globalClaudeMdPath)) {
     globalClaudeMd = fs.readFileSync(globalClaudeMdPath, 'utf-8');
   }
 
-  // Discover additional directories mounted at /workspace/extra/*
-  // These are passed to the SDK so their CLAUDE.md files are loaded automatically
+  // Discover additional directories from env var or by scanning legacy path
   const extraDirs: string[] = [];
-  const extraBase = '/workspace/extra';
-  if (fs.existsSync(extraBase)) {
-    for (const entry of fs.readdirSync(extraBase)) {
-      const fullPath = path.join(extraBase, entry);
-      if (fs.statSync(fullPath).isDirectory()) {
-        extraDirs.push(fullPath);
+  if (EXTRA_DIRS_ENV) {
+    for (const dir of EXTRA_DIRS_ENV.split(':').filter(Boolean)) {
+      if (fs.existsSync(dir) && fs.statSync(dir).isDirectory()) {
+        extraDirs.push(dir);
       }
     }
   }
@@ -416,7 +432,8 @@ async function runQuery(
   for await (const message of query({
     prompt: stream,
     options: {
-      cwd: '/workspace/group',
+      model: 'claude-opus-4-6',
+      cwd: GROUP_DIR,
       additionalDirectories: extraDirs.length > 0 ? extraDirs : undefined,
       resume: sessionId,
       resumeSessionAt: resumeAt,
@@ -436,6 +453,7 @@ async function runQuery(
       env: sdkEnv,
       permissionMode: 'bypassPermissions',
       allowDangerouslySkipPermissions: true,
+      includePartialMessages: true,
       settingSources: ['project', 'user'],
       mcpServers: {
         nanoclaw: {
@@ -445,6 +463,7 @@ async function runQuery(
             NANOCLAW_CHAT_JID: containerInput.chatJid,
             NANOCLAW_GROUP_FOLDER: containerInput.groupFolder,
             NANOCLAW_IS_MAIN: containerInput.isMain ? '1' : '0',
+            NANOCLAW_IPC_DIR: IPC_BASE_DIR,
           },
         },
       },
@@ -460,6 +479,31 @@ async function runQuery(
 
     if (message.type === 'assistant' && 'uuid' in message) {
       lastAssistantUuid = (message as { uuid: string }).uuid;
+      // Reset streaming state for each new assistant turn
+      streamingText = '';
+      isStreamingTextBlock = false;
+    }
+
+    // Token-level streaming: capture text deltas and emit periodically
+    if (message.type === 'stream_event' && (message as any).parent_tool_use_id === null) {
+      const event = (message as any).event;
+      if (event?.type === 'content_block_start' && event?.content_block?.type === 'text') {
+        isStreamingTextBlock = true;
+        streamingText = '';
+        lastStreamEmit = 0;
+      } else if (isStreamingTextBlock && event?.type === 'content_block_delta' && event?.delta?.type === 'text_delta') {
+        streamingText += event.delta.text;
+        const now = Date.now();
+        if (now - lastStreamEmit >= 500 && streamingText.length > 10) {
+          writeOutput({ status: 'success', result: streamingText, isPartial: true });
+          lastStreamEmit = now;
+        }
+      } else if (isStreamingTextBlock && event?.type === 'content_block_stop') {
+        if (streamingText) {
+          writeOutput({ status: 'success', result: streamingText, isPartial: true });
+        }
+        isStreamingTextBlock = false;
+      }
     }
 
     if (message.type === 'system' && message.subtype === 'init') {
@@ -495,8 +539,6 @@ async function main(): Promise<void> {
   try {
     const stdinData = await readStdin();
     containerInput = JSON.parse(stdinData);
-    // Delete the temp file the entrypoint wrote — it contains secrets
-    try { fs.unlinkSync('/tmp/input.json'); } catch { /* may not exist */ }
     log(`Received input for group: ${containerInput.groupFolder}`);
   } catch (err) {
     writeOutput({

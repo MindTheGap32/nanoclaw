@@ -6,15 +6,18 @@ import makeWASocket, {
   Browsers,
   DisconnectReason,
   WASocket,
+  downloadMediaMessage,
   makeCacheableSignalKeyStore,
   useMultiFileAuthState,
 } from '@whiskeysockets/baileys';
 
 import { ASSISTANT_HAS_OWN_NUMBER, ASSISTANT_NAME, STORE_DIR } from '../config.js';
+import { isVoiceMessage, transcribeAudioMessage } from '../transcription.js';
 import {
   getLastGroupSync,
   setLastGroupSync,
   updateChatName,
+  upsertContacts,
 } from '../db.js';
 import { logger } from '../logger.js';
 import { Channel, OnInboundMessage, OnChatMetadata, RegisteredGroup } from '../types.js';
@@ -36,6 +39,8 @@ export class WhatsAppChannel implements Channel {
   private outgoingQueue: Array<{ jid: string; text: string }> = [];
   private flushing = false;
   private groupSyncTimerStarted = false;
+  // Cache recent image messages for media download (keyed by chatJid, keeps latest per chat)
+  private recentImageMessages = new Map<string, import('@whiskeysockets/baileys').WAMessage>();
 
   private opts: WhatsAppChannelOpts;
 
@@ -105,6 +110,11 @@ export class WhatsAppChannel implements Channel {
         // Announce availability so WhatsApp relays subsequent presence updates (typing indicators)
         this.sock.sendPresenceUpdate('available').catch(() => {});
 
+        // Force app state resync to pull contacts from phone's address book
+        this.sock.resyncAppState?.(['critical_block', 'critical_unblock_low', 'regular_high', 'regular_low', 'regular'], false).catch((err: Error) => {
+          logger.debug({ err: err.message }, 'App state resync failed (non-critical)');
+        });
+
         // Build LID to phone mapping from auth state for self-chat translation
         if (this.sock.user) {
           const phoneUser = this.sock.user.id.split(':')[0];
@@ -144,6 +154,36 @@ export class WhatsAppChannel implements Channel {
 
     this.sock.ev.on('creds.update', saveCreds);
 
+    // Sync contacts to database so agents can look up WhatsApp users
+    this.sock.ev.on('contacts.upsert', (contacts) => {
+      logger.info({ count: contacts.length }, 'Contacts upsert received');
+      upsertContacts(contacts.map((c) => ({
+        jid: c.id,
+        name: c.name || undefined,
+        notify: c.notify || undefined,
+      })));
+    });
+
+    this.sock.ev.on('contacts.update', (updates) => {
+      upsertContacts(updates.map((c) => ({
+        jid: c.id!,
+        name: (c as any).name || undefined,
+        notify: (c as any).notify || undefined,
+      })));
+    });
+
+    // History sync also carries contacts
+    this.sock.ev.on('messaging-history.set', ({ contacts }) => {
+      if (contacts && contacts.length > 0) {
+        logger.info({ count: contacts.length }, 'Contacts from history sync');
+        upsertContacts(contacts.map((c) => ({
+          jid: c.id,
+          name: c.name || undefined,
+          notify: c.notify || undefined,
+        })));
+      }
+    });
+
     this.sock.ev.on('messages.upsert', async ({ messages }) => {
       for (const msg of messages) {
         if (!msg.message) continue;
@@ -157,20 +197,59 @@ export class WhatsAppChannel implements Channel {
           Number(msg.messageTimestamp) * 1000,
         ).toISOString();
 
+        // Cache image messages for media download
+        if (msg.message?.imageMessage) {
+          this.recentImageMessages.set(chatJid, msg);
+          logger.debug({ chatJid }, 'Cached image message for download');
+        }
+
         // Always notify about chat metadata for group discovery
         this.opts.onChatMetadata(chatJid, timestamp);
 
         // Only deliver full message for registered groups
         const groups = this.opts.registeredGroups();
         if (groups[chatJid]) {
-          const content =
+          const imageCaption = msg.message?.imageMessage?.caption;
+          const videoCaption = msg.message?.videoMessage?.caption;
+          let content =
             msg.message?.conversation ||
             msg.message?.extendedTextMessage?.text ||
-            msg.message?.imageMessage?.caption ||
-            msg.message?.videoMessage?.caption ||
             '';
+
+          // Surface image/video messages so the agent knows media was sent
+          if (!content && msg.message?.imageMessage) {
+            content = imageCaption ? `[Image: ${imageCaption}]` : '[Image]';
+          } else if (!content && msg.message?.videoMessage) {
+            content = videoCaption ? `[Video: ${videoCaption}]` : '[Video]';
+          } else if (imageCaption && !content) {
+            content = imageCaption;
+          } else if (videoCaption && !content) {
+            content = videoCaption;
+          }
+
+          // Transcribe voice messages
+          if (isVoiceMessage(msg)) {
+            try {
+              const transcript = await transcribeAudioMessage(msg, this.sock);
+              if (transcript) {
+                content = `[Voice: ${transcript}]`;
+                logger.info({ chatJid, length: transcript.length }, 'Transcribed voice message');
+              } else {
+                content = '[Voice Message - transcription unavailable]';
+              }
+            } catch (err) {
+              logger.error({ err }, 'Voice transcription error');
+              content = '[Voice Message - transcription failed]';
+            }
+          }
+
           const sender = msg.key.participant || msg.key.remoteJid || '';
           const senderName = msg.pushName || sender.split('@')[0];
+
+          // Store sender as contact (captures push names from incoming messages)
+          if (sender.endsWith('@s.whatsapp.net') && msg.pushName) {
+            upsertContacts([{ jid: sender, notify: msg.pushName }]);
+          }
 
           const fromMe = msg.key.fromMe || false;
           // Detect bot messages: with own number, fromMe is reliable
@@ -197,13 +276,12 @@ export class WhatsAppChannel implements Channel {
   }
 
   async sendMessage(jid: string, text: string): Promise<void> {
-    // Prefix bot messages with assistant name so users know who's speaking.
-    // On a shared number, prefix is also needed in DMs (including self-chat)
-    // to distinguish bot output from user messages.
-    // Skip only when the assistant has its own dedicated phone number.
-    const prefixed = ASSISTANT_HAS_OWN_NUMBER
-      ? text
-      : `${ASSISTANT_NAME}: ${text}`;
+    // Prefix bot messages in groups so users know who's speaking on a shared
+    // number. DMs don't need a prefix — the recipient sees the phone number.
+    const isGroup = jid.endsWith('@g.us');
+    const prefixed = (!ASSISTANT_HAS_OWN_NUMBER && isGroup)
+      ? `${ASSISTANT_NAME}: ${text}`
+      : text;
 
     if (!this.connected) {
       this.outgoingQueue.push({ jid, text: prefixed });
@@ -217,6 +295,57 @@ export class WhatsAppChannel implements Channel {
       // If send fails, queue it for retry on reconnect
       this.outgoingQueue.push({ jid, text: prefixed });
       logger.warn({ jid, err, queueSize: this.outgoingQueue.length }, 'Failed to send, message queued');
+    }
+  }
+
+  async sendImage(jid: string, imagePath: string, caption?: string): Promise<void> {
+    if (!this.connected) {
+      logger.warn({ jid, imagePath }, 'WA disconnected, cannot send image');
+      return;
+    }
+    try {
+      const imageBuffer = fs.readFileSync(imagePath);
+      await this.sock.sendMessage(jid, {
+        image: imageBuffer,
+        caption: caption || undefined,
+      });
+      logger.info({ jid, imagePath }, 'Image sent');
+    } catch (err) {
+      logger.error({ jid, imagePath, err }, 'Failed to send image');
+    }
+  }
+
+  async downloadLatestImage(jid: string, savePath: string): Promise<boolean> {
+    if (!this.connected) {
+      logger.warn({ jid }, 'WA disconnected, cannot download image');
+      return false;
+    }
+    try {
+      const imageMsg = this.recentImageMessages.get(jid);
+      if (!imageMsg) {
+        logger.warn({ jid }, 'No cached image message found');
+        return false;
+      }
+      const buffer = (await downloadMediaMessage(
+        imageMsg,
+        'buffer',
+        {},
+        {
+          logger: logger as any,
+          reuploadRequest: this.sock.updateMediaMessage,
+        },
+      )) as Buffer;
+      if (!buffer || buffer.length === 0) {
+        logger.error({ jid }, 'Failed to download image buffer');
+        return false;
+      }
+      fs.mkdirSync(path.dirname(savePath), { recursive: true });
+      fs.writeFileSync(savePath, buffer);
+      logger.info({ jid, savePath, bytes: buffer.length }, 'Image downloaded');
+      return true;
+    } catch (err) {
+      logger.error({ jid, err }, 'Failed to download latest image');
+      return false;
     }
   }
 

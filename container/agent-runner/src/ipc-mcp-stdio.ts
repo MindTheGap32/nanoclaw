@@ -11,7 +11,8 @@ import fs from 'fs';
 import path from 'path';
 import { CronExpressionParser } from 'cron-parser';
 
-const IPC_DIR = '/workspace/ipc';
+// Path from environment variable (set by agent-runner), with container default for backwards compat
+const IPC_DIR = process.env.NANOCLAW_IPC_DIR || '/workspace/ipc';
 const MESSAGES_DIR = path.join(IPC_DIR, 'messages');
 const TASKS_DIR = path.join(IPC_DIR, 'tasks');
 
@@ -41,15 +42,30 @@ const server = new McpServer({
 
 server.tool(
   'send_message',
-  "Send a message to the user or group immediately while you're still running. Use this for progress updates or to send multiple messages. You can call this multiple times. Note: when running as a scheduled task, your final output is NOT sent to the user — use this tool if you need to communicate with the user or group.",
+  `Send a message immediately while you're still running. Use this for progress updates or to send multiple messages. You can call this multiple times. Note: when running as a scheduled task, your final output is NOT sent to the user — use this tool if you need to communicate.
+
+By default sends to the current chat. Main group can send to ANY chat by specifying target_jid.
+JID formats: WhatsApp group "...@g.us", WhatsApp DM "972...@s.whatsapp.net", Telegram "tg:123456".`,
   {
     text: z.string().describe('The message text to send'),
+    target_jid: z.string().optional().describe('(Main only) Send to a different chat. WhatsApp DM: "972XXXXXXXXX@s.whatsapp.net", group: "...@g.us", Telegram: "tg:123456"'),
     sender: z.string().optional().describe('Your role/identity name (e.g. "Researcher"). When set, messages appear from a dedicated bot in Telegram.'),
   },
   async (args) => {
+    let targetJid = chatJid;
+    if (args.target_jid) {
+      if (!isMain) {
+        return {
+          content: [{ type: 'text' as const, text: 'Only the main group can send to other chats.' }],
+          isError: true,
+        };
+      }
+      targetJid = args.target_jid;
+    }
+
     const data: Record<string, string | undefined> = {
       type: 'message',
-      chatJid,
+      chatJid: targetJid,
       text: args.text,
       sender: args.sender || undefined,
       groupFolder,
@@ -58,7 +74,7 @@ server.tool(
 
     writeIpcFile(MESSAGES_DIR, data);
 
-    return { content: [{ type: 'text' as const, text: 'Message sent.' }] };
+    return { content: [{ type: 'text' as const, text: `Message sent to ${targetJid}.` }] };
   },
 );
 
@@ -270,6 +286,45 @@ Use available_groups.json to find the JID for a group. The folder name should be
 
     return {
       content: [{ type: 'text' as const, text: `Group "${args.name}" registered. It will start receiving messages immediately.` }],
+    };
+  },
+);
+
+server.tool(
+  'download_image',
+  `Download the most recent image sent in a WhatsApp chat. Saves it to a local file path so you can view it with the Read tool.
+
+Use this when a user sends an image (you'll see "[Image]" or "[Image: caption]" in the message). The image is saved to the path you specify, then you can read it.`,
+  {
+    save_path: z.string().describe('Absolute file path to save the image to (e.g., "/tmp/image.jpg")'),
+    source_jid: z.string().optional().describe('(Main only) JID to download from. Defaults to current chat.'),
+  },
+  async (args) => {
+    const targetJid = isMain && args.source_jid ? args.source_jid : chatJid;
+
+    const data = {
+      type: 'download_image',
+      chatJid: targetJid,
+      savePath: args.save_path,
+      groupFolder,
+      timestamp: new Date().toISOString(),
+    };
+
+    writeIpcFile(MESSAGES_DIR, data);
+
+    // Wait a moment for the host to process the download
+    await new Promise(resolve => setTimeout(resolve, 2000));
+
+    // Check if the file was created
+    const exists = fs.existsSync(args.save_path);
+    if (exists) {
+      return {
+        content: [{ type: 'text' as const, text: `Image downloaded to ${args.save_path}. Use the Read tool to view it.` }],
+      };
+    }
+
+    return {
+      content: [{ type: 'text' as const, text: `Download requested for ${args.save_path}. The file may take a moment to appear — check with Read tool.` }],
     };
   },
 );

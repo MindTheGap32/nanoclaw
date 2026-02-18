@@ -16,6 +16,8 @@ import { RegisteredGroup } from './types.js';
 
 export interface IpcDeps {
   sendMessage: (jid: string, text: string) => Promise<void>;
+  sendImage?: (jid: string, imagePath: string, caption?: string) => Promise<void>;
+  downloadLatestImage?: (jid: string, savePath: string) => Promise<boolean>;
   registeredGroups: () => Record<string, RegisteredGroup>;
   registerGroup: (jid: string, group: RegisteredGroup) => void;
   syncGroupMetadata: (force: boolean) => Promise<void>;
@@ -71,14 +73,25 @@ export function startIpcWatcher(deps: IpcDeps): void {
             const filePath = path.join(messagesDir, file);
             try {
               const data = JSON.parse(fs.readFileSync(filePath, 'utf-8'));
-              if (data.type === 'message' && data.chatJid && data.text) {
+              if (data.type === 'download_image' && data.chatJid && data.savePath && deps.downloadLatestImage) {
+                const ok = await deps.downloadLatestImage(data.chatJid, data.savePath);
+                logger.info({ chatJid: data.chatJid, savePath: data.savePath, ok }, 'IPC download_image');
+              } else if (data.type === 'message' && data.chatJid && (data.text || data.image)) {
                 // Authorization: verify this group can send to this chatJid
                 const targetGroup = registeredGroups[data.chatJid];
                 if (
                   isMain ||
                   (targetGroup && targetGroup.folder === sourceGroup)
                 ) {
-                  await deps.sendMessage(data.chatJid, data.text);
+                  if (data.image && deps.sendImage) {
+                    await deps.sendImage(data.chatJid, data.image, data.caption);
+                    logger.info(
+                      { chatJid: data.chatJid, sourceGroup, image: data.image },
+                      'IPC image sent',
+                    );
+                  } else if (data.text) {
+                    await deps.sendMessage(data.chatJid, data.text);
+                  }
                   logger.info(
                     { chatJid: data.chatJid, sourceGroup },
                     'IPC message sent',

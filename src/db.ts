@@ -28,6 +28,13 @@ function createSchema(database: Database.Database): void {
     );
     CREATE INDEX IF NOT EXISTS idx_timestamp ON messages(timestamp);
 
+    CREATE TABLE IF NOT EXISTS contacts (
+      jid TEXT PRIMARY KEY,
+      name TEXT,
+      notify TEXT,
+      phone TEXT
+    );
+
     CREATE TABLE IF NOT EXISTS scheduled_tasks (
       id TEXT PRIMARY KEY,
       group_folder TEXT NOT NULL,
@@ -67,7 +74,7 @@ function createSchema(database: Database.Database): void {
     CREATE TABLE IF NOT EXISTS registered_groups (
       jid TEXT PRIMARY KEY,
       name TEXT NOT NULL,
-      folder TEXT NOT NULL UNIQUE,
+      folder TEXT NOT NULL,
       trigger_pattern TEXT NOT NULL,
       added_at TEXT NOT NULL,
       container_config TEXT,
@@ -93,6 +100,15 @@ function createSchema(database: Database.Database): void {
     database.prepare(
       `UPDATE messages SET is_bot_message = 1 WHERE content LIKE ?`,
     ).run(`${ASSISTANT_NAME}:%`);
+  } catch {
+    /* column already exists */
+  }
+
+  // Add only_from_me column if it doesn't exist (migration for existing DBs)
+  try {
+    database.exec(
+      `ALTER TABLE registered_groups ADD COLUMN only_from_me INTEGER DEFAULT 0`,
+    );
   } catch {
     /* column already exists */
   }
@@ -158,6 +174,25 @@ export function updateChatName(chatJid: string, name: string): void {
     ON CONFLICT(jid) DO UPDATE SET name = excluded.name
   `,
   ).run(chatJid, name, new Date().toISOString());
+}
+
+export function upsertContacts(contacts: Array<{ jid: string; name?: string; notify?: string }>): void {
+  const stmt = db.prepare(`
+    INSERT INTO contacts (jid, name, notify, phone) VALUES (?, ?, ?, ?)
+    ON CONFLICT(jid) DO UPDATE SET
+      name = COALESCE(excluded.name, contacts.name),
+      notify = COALESCE(excluded.notify, contacts.notify),
+      phone = COALESCE(excluded.phone, contacts.phone)
+  `);
+
+  const tx = db.transaction(() => {
+    for (const c of contacts) {
+      // Extract phone number from JID (e.g., "972544274490@s.whatsapp.net" -> "972544274490")
+      const phone = c.jid.endsWith('@s.whatsapp.net') ? c.jid.replace('@s.whatsapp.net', '') : null;
+      stmt.run(c.jid, c.name || null, c.notify || null, phone);
+    }
+  });
+  tx();
 }
 
 export interface ChatInfo {
@@ -259,7 +294,7 @@ export function getNewMessages(
   // Filter bot messages using both the is_bot_message flag AND the content
   // prefix as a backstop for messages written before the migration ran.
   const sql = `
-    SELECT id, chat_jid, sender, sender_name, content, timestamp
+    SELECT id, chat_jid, sender, sender_name, content, timestamp, is_from_me
     FROM messages
     WHERE timestamp > ? AND chat_jid IN (${placeholders})
       AND is_bot_message = 0 AND content NOT LIKE ?
@@ -286,7 +321,7 @@ export function getMessagesSince(
   // Filter bot messages using both the is_bot_message flag AND the content
   // prefix as a backstop for messages written before the migration ran.
   const sql = `
-    SELECT id, chat_jid, sender, sender_name, content, timestamp
+    SELECT id, chat_jid, sender, sender_name, content, timestamp, is_from_me
     FROM messages
     WHERE chat_jid = ? AND timestamp > ?
       AND is_bot_message = 0 AND content NOT LIKE ?
@@ -487,6 +522,7 @@ export function getRegisteredGroup(
         added_at: string;
         container_config: string | null;
         requires_trigger: number | null;
+        only_from_me: number | null;
       }
     | undefined;
   if (!row) return undefined;
@@ -500,6 +536,7 @@ export function getRegisteredGroup(
       ? JSON.parse(row.container_config)
       : undefined,
     requiresTrigger: row.requires_trigger === null ? undefined : row.requires_trigger === 1,
+    onlyFromMe: row.only_from_me === 1 ? true : undefined,
   };
 }
 
@@ -508,8 +545,8 @@ export function setRegisteredGroup(
   group: RegisteredGroup,
 ): void {
   db.prepare(
-    `INSERT OR REPLACE INTO registered_groups (jid, name, folder, trigger_pattern, added_at, container_config, requires_trigger)
-     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT OR REPLACE INTO registered_groups (jid, name, folder, trigger_pattern, added_at, container_config, requires_trigger, only_from_me)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
   ).run(
     jid,
     group.name,
@@ -518,6 +555,7 @@ export function setRegisteredGroup(
     group.added_at,
     group.containerConfig ? JSON.stringify(group.containerConfig) : null,
     group.requiresTrigger === undefined ? 1 : group.requiresTrigger ? 1 : 0,
+    group.onlyFromMe ? 1 : 0,
   );
 }
 
@@ -532,6 +570,7 @@ export function getAllRegisteredGroups(): Record<string, RegisteredGroup> {
     added_at: string;
     container_config: string | null;
     requires_trigger: number | null;
+    only_from_me: number | null;
   }>;
   const result: Record<string, RegisteredGroup> = {};
   for (const row of rows) {
@@ -544,6 +583,7 @@ export function getAllRegisteredGroups(): Record<string, RegisteredGroup> {
         ? JSON.parse(row.container_config)
         : undefined,
       requiresTrigger: row.requires_trigger === null ? undefined : row.requires_trigger === 1,
+      onlyFromMe: row.only_from_me === 1 ? true : undefined,
     };
   }
   return result;

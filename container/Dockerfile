@@ -21,9 +21,24 @@ RUN apt-get update && apt-get install -y \
     libcups2 \
     libdrm2 \
     libxshmfence1 \
+    python3 \
+    python3-pip \
     curl \
     git \
+    unzip \
+    && pip3 install --break-system-packages websockets awscli \
     && rm -rf /var/lib/apt/lists/*
+
+# Install GitHub CLI
+RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+    | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg \
+    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+    | tee /etc/apt/sources.list.d/github-cli.list > /dev/null \
+    && apt-get update && apt-get install -y gh && rm -rf /var/lib/apt/lists/*
+
+# Install Supabase CLI
+RUN curl -fsSL https://github.com/supabase/cli/releases/latest/download/supabase_linux_amd64.tar.gz \
+    | tar -xz -C /usr/local/bin supabase
 
 # Set Chromium path for agent-browser
 ENV AGENT_BROWSER_EXECUTABLE_PATH=/usr/bin/chromium
@@ -55,8 +70,14 @@ RUN mkdir -p /workspace/group /workspace/global /workspace/extra /workspace/ipc/
 # Follow-up messages arrive via IPC files in /workspace/ipc/input/
 RUN printf '#!/bin/bash\nset -e\ncd /app && npx tsc --outDir /tmp/dist 2>&1 >&2\nln -s /app/node_modules /tmp/dist/node_modules\nchmod -R a-w /tmp/dist\ncat > /tmp/input.json\nnode /tmp/dist/index.js < /tmp/input.json\n' > /app/entrypoint.sh && chmod +x /app/entrypoint.sh
 
+# GhostWire CLI wrapper — controls host Chrome browser via WebSocket
+RUN printf '#!/bin/bash\nset -euo pipefail\nif [[ "${1:-}" == "server" ]]; then\n  echo "Server management not available inside container. Manage from host."\n  exit 0\nfi\nexec python3 /workspace/extra/projects/ghostwire/server/cli.py "$@"\n' > /usr/local/bin/gw && chmod +x /usr/local/bin/gw
+
+# Screenshots directory for GhostWire
+RUN mkdir -p /home/node/.local/share/ghostwire/screenshots
+
 # Set ownership to node user (non-root) for writable directories
-RUN chown -R node:node /workspace
+RUN chown -R node:node /workspace /home/node/.local
 
 # Switch to non-root user (required for --dangerously-skip-permissions)
 USER node

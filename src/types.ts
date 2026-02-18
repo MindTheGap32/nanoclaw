@@ -39,6 +39,7 @@ export interface RegisteredGroup {
   added_at: string;
   containerConfig?: ContainerConfig;
   requiresTrigger?: boolean; // Default: true for groups, false for solo chats
+  onlyFromMe?: boolean; // When true, only process messages where is_from_me=1 (owner's messages)
 }
 
 export interface NewMessage {
@@ -87,6 +88,9 @@ export interface Channel {
   disconnect(): Promise<void>;
   // Optional: typing indicator. Channels that support it implement it.
   setTyping?(jid: string, isTyping: boolean): Promise<void>;
+  // Optional: streaming support. Send a message and return its ID for later editing.
+  sendMessageWithId?(jid: string, text: string): Promise<string>;
+  editMessage?(jid: string, messageId: string, text: string): Promise<void>;
 }
 
 // Callback type that channels use to deliver inbound messages

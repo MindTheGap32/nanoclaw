@@ -26,7 +26,7 @@ export interface SchedulerDependencies {
   registeredGroups: () => Record<string, RegisteredGroup>;
   getSessions: () => Record<string, string>;
   queue: GroupQueue;
-  onProcess: (groupJid: string, proc: ChildProcess, containerName: string, groupFolder: string) => void;
+  onProcess: (groupJid: string, proc: ChildProcess, containerName: string, groupFolder: string, inputDir: string) => void;
   sendMessage: (jid: string, text: string) => Promise<void>;
 }
 
@@ -96,7 +96,7 @@ async function runTask(
   const resetIdleTimer = () => {
     if (idleTimer) clearTimeout(idleTimer);
     idleTimer = setTimeout(() => {
-      logger.debug({ taskId: task.id }, 'Scheduled task idle timeout, closing container stdin');
+      logger.debug({ taskId: task.id }, 'Scheduled task idle timeout, closing agent stdin');
       deps.queue.closeStdin(task.chat_jid);
     }, IDLE_TIMEOUT);
   };
@@ -112,7 +112,7 @@ async function runTask(
         isMain,
         isScheduledTask: true,
       },
-      (proc, containerName) => deps.onProcess(task.chat_jid, proc, containerName, task.group_folder),
+      (proc, containerName, inputDir) => deps.onProcess(task.chat_jid, proc, containerName, task.group_folder, inputDir),
       async (streamedOutput: ContainerOutput) => {
         if (streamedOutput.result) {
           result = streamedOutput.result;
