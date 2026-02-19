@@ -19,6 +19,7 @@ Full contact list is in the "Partnerships & Contacts" section below. Always chec
 - Run bash commands in your sandbox
 - Schedule tasks to run later or on a recurring basis
 - Send messages back to the chat
+- **Communicate with Claude Code mux sessions** running on Chen's machine (see Claude Mux section below)
 
 ## Communication
 
@@ -357,3 +358,44 @@ When scheduling tasks for other groups, use the `target_group_jid` parameter wit
 - `schedule_task(prompt: "...", schedule_type: "cron", schedule_value: "0 9 * * 1", target_group_jid: "120363336345536173@g.us")`
 
 The task will run in that group's context with access to their files and memory.
+
+---
+
+## Claude Mux — Communicate with Local Claude Code Sessions
+
+Chen runs Claude Code sessions using `claude-mux` (or `claudebad-mux`) instead of `claude`. This wraps sessions in tmux with a background inbox watcher. The Claude Code TUI is fully native — thinking, questions, tool approvals all work normally.
+
+### How It Works
+
+- Each session runs inside a tmux session named `mux-{name}`
+- A background watcher polls `~/.claude/mux/{name}/inbox/` for external messages
+- When a message file appears, the watcher uses `tmux send-keys` to type it into the Claude session
+- Session metadata is at `~/.claude/mux/{name}/session.json`
+
+### Commands (always use `CLAUDE_MUX_DIR=/home/mindthegap/.claude/mux`)
+
+```bash
+# List active sessions
+CLAUDE_MUX_DIR=/home/mindthegap/.claude/mux claude-mux-send --list
+
+# Send a message to a session (partial name match supported)
+CLAUDE_MUX_DIR=/home/mindthegap/.claude/mux claude-mux-send waterduty "check the deployment status"
+
+# Check session status
+CLAUDE_MUX_DIR=/home/mindthegap/.claude/mux claude-mux-send waterduty --status
+```
+
+### When to Use
+
+When Chen says things like:
+- "tell the waterduty session to..." → send a message to the waterduty mux session
+- "what's the waterduty agent working on?" → check status
+- "list my sessions" → list active mux sessions
+
+Session names auto-generate from the directory name + a short ID (e.g. `waterduty-a3f1b2`), but partial matching works — just use "waterduty" to match any waterduty session.
+
+### Important Notes
+
+- Messages are injected via `tmux send-keys` — they appear as if Chen typed them
+- If Claude is mid-response, the watcher sends Escape + Ctrl+U first to clear, then types the message
+- Chen can detach from a mux session with `Ctrl+B, D` and reattach with `claude-mux <name>`
