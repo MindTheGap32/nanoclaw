@@ -79,6 +79,51 @@ JID formats: WhatsApp group "...@g.us", WhatsApp DM "972...@s.whatsapp.net", Tel
 );
 
 server.tool(
+  'send_photo',
+  `Send a photo/image to the current chat or another chat. Use this to share screenshots, generated images, or any image file.
+
+The image must be a file path accessible from the agent's workspace (e.g., a screenshot saved by GhostWire or agent-browser).`,
+  {
+    image_path: z.string().describe('Absolute file path to the image to send (e.g., "/tmp/screenshot.png")'),
+    caption: z.string().optional().describe('Optional caption text to include with the photo'),
+    target_jid: z.string().optional().describe('(Main only) Send to a different chat. Defaults to current chat.'),
+  },
+  async (args) => {
+    let targetJid = chatJid;
+    if (args.target_jid) {
+      if (!isMain) {
+        return {
+          content: [{ type: 'text' as const, text: 'Only the main group can send to other chats.' }],
+          isError: true,
+        };
+      }
+      targetJid = args.target_jid;
+    }
+
+    // Verify the file exists
+    if (!fs.existsSync(args.image_path)) {
+      return {
+        content: [{ type: 'text' as const, text: `File not found: ${args.image_path}` }],
+        isError: true,
+      };
+    }
+
+    const data: Record<string, string | undefined> = {
+      type: 'message',
+      chatJid: targetJid,
+      image: args.image_path,
+      caption: args.caption || undefined,
+      groupFolder,
+      timestamp: new Date().toISOString(),
+    };
+
+    writeIpcFile(MESSAGES_DIR, data);
+
+    return { content: [{ type: 'text' as const, text: `Photo sent to ${targetJid}.` }] };
+  },
+);
+
+server.tool(
   'schedule_task',
   `Schedule a recurring or one-time task. The task will run as a full agent with access to all tools.
 

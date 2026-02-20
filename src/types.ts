@@ -92,6 +92,8 @@ export interface Channel {
   sendMessageWithId?(jid: string, text: string): Promise<string>;
   editMessage?(jid: string, messageId: string, text: string): Promise<void>;
   deleteMessage?(jid: string, messageId: string): Promise<void>;
+  // Optional: send an image/photo file.
+  sendImage?(jid: string, imagePath: string, caption?: string): Promise<void>;
 }
 
 // Callback type that channels use to deliver inbound messages

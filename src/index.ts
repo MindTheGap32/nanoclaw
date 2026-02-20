@@ -2,6 +2,14 @@ import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
 
+/** Race a promise against a timeout. Resolves to undefined on timeout. */
+function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T | undefined> {
+  return Promise.race([
+    promise,
+    new Promise<undefined>((resolve) => setTimeout(() => resolve(undefined), ms)),
+  ]);
+}
+
 import {
   ASSISTANT_NAME,
   DATA_DIR,
@@ -209,22 +217,28 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     if (channel.sendMessageWithId && channel.editMessage) {
       const streamType = result.streamType || 'text';
 
+      // All partial edits use a 5s timeout to prevent blocking the output chain
+      // if Telegram API stalls (e.g. during 409 conflicts or rate limiting).
+      const EDIT_TIMEOUT = 5000;
+
       if (result.isPartial && streamType === 'thinking') {
         // Thinking stream — show in a separate "thinking" message with indicator
         const thinkingDisplay = `💭 _${raw.slice(0, 3900)}_`;
         if (thinkingMsgId) {
-          try {
-            if (thinkingDisplay !== lastThinkingText) {
-              await channel.editMessage(chatJid, thinkingMsgId, thinkingDisplay);
-              lastThinkingText = thinkingDisplay;
-            }
-          } catch {
-            // Edit failed — ignore for partials
+          if (thinkingDisplay !== lastThinkingText) {
+            const ok = await withTimeout(
+              channel.editMessage(chatJid, thinkingMsgId, thinkingDisplay).then(() => true).catch(() => false),
+              EDIT_TIMEOUT,
+            );
+            if (ok) lastThinkingText = thinkingDisplay;
           }
         } else {
           try {
-            thinkingMsgId = await channel.sendMessageWithId(chatJid, thinkingDisplay);
-            lastThinkingText = thinkingDisplay;
+            const id = await withTimeout(channel.sendMessageWithId(chatJid, thinkingDisplay), EDIT_TIMEOUT);
+            if (id) {
+              thinkingMsgId = id;
+              lastThinkingText = thinkingDisplay;
+            }
           } catch (err) {
             logger.warn({ err }, 'Failed to send thinking message');
           }
@@ -233,16 +247,18 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
         // Tool use summary — update the thinking message with tool info
         const toolDisplay = `🔧 ${raw.slice(0, 3900)}`;
         if (thinkingMsgId) {
-          try {
-            await channel.editMessage(chatJid, thinkingMsgId, toolDisplay);
-            lastThinkingText = toolDisplay;
-          } catch {
-            // ignore edit failures
-          }
+          const ok = await withTimeout(
+            channel.editMessage(chatJid, thinkingMsgId, toolDisplay).then(() => true).catch(() => false),
+            EDIT_TIMEOUT,
+          );
+          if (ok) lastThinkingText = toolDisplay;
         } else {
           try {
-            thinkingMsgId = await channel.sendMessageWithId(chatJid, toolDisplay);
-            lastThinkingText = toolDisplay;
+            const id = await withTimeout(channel.sendMessageWithId(chatJid, toolDisplay), EDIT_TIMEOUT);
+            if (id) {
+              thinkingMsgId = id;
+              lastThinkingText = toolDisplay;
+            }
           } catch (err) {
             logger.warn({ err }, 'Failed to send tool message');
           }
@@ -254,35 +270,53 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
         const formatted = formatOutbound(text);
         if (!formatted) return;
 
+        // Detect new response: if the new text is shorter than what we've been
+        // streaming, the agent started a fresh text block (e.g. responding to a
+        // piped follow-up message). Delete the old streaming preview.
+        if (textMsgId && formatted.length < lastStreamedText.length * 0.5) {
+          if (channel.deleteMessage) {
+            await withTimeout(
+              channel.deleteMessage(chatJid, textMsgId).catch(() => {}),
+              EDIT_TIMEOUT,
+            );
+          }
+          textMsgId = undefined;
+          lastStreamedText = '';
+        }
+
         // Delete thinking message when text starts flowing
         if (thinkingMsgId && channel.deleteMessage) {
-          try {
-            await channel.deleteMessage(chatJid, thinkingMsgId);
-          } catch { /* ignore */ }
+          await withTimeout(
+            channel.deleteMessage(chatJid, thinkingMsgId).catch(() => {}),
+            EDIT_TIMEOUT,
+          );
           thinkingMsgId = undefined;
           lastThinkingText = '';
         }
 
         if (textMsgId) {
-          try {
-            if (formatted !== lastStreamedText) {
-              await channel.editMessage(chatJid, textMsgId, formatted);
-              lastStreamedText = formatted;
-            }
-          } catch {
-            // Edit failed — ignore for partials
+          if (formatted !== lastStreamedText) {
+            const ok = await withTimeout(
+              channel.editMessage(chatJid, textMsgId, formatted).then(() => true).catch(() => false),
+              EDIT_TIMEOUT,
+            );
+            if (ok) lastStreamedText = formatted;
           }
         } else {
           try {
-            textMsgId = await channel.sendMessageWithId(chatJid, formatted);
-            lastStreamedText = formatted;
-            outputSentToUser = true;
+            const id = await withTimeout(channel.sendMessageWithId(chatJid, formatted), EDIT_TIMEOUT);
+            if (id) {
+              textMsgId = id;
+              lastStreamedText = formatted;
+              outputSentToUser = true;
+            }
           } catch (err) {
             logger.warn({ err }, 'Failed to send streaming text message');
           }
         }
       } else if (!result.isPartial) {
-        // Final result — clean up thinking and send/edit the final text
+        // Final result — edit the streaming message with complete text,
+        // then send a brief "done" notification as a new message.
         const text = raw.replace(/<internal>[\s\S]*?<\/internal>/g, '').trim();
         if (!text) return;
         const formatted = formatOutbound(text);
@@ -296,16 +330,17 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
           thinkingMsgId = undefined;
         }
 
+        // Edit streaming preview to final complete text
         if (textMsgId && formatted !== lastStreamedText) {
           try {
             await channel.editMessage(chatJid, textMsgId, formatted);
             lastStreamedText = formatted;
           } catch {
+            // Edit failed — send as new message instead
             await channel.sendMessage(chatJid, formatted);
-            textMsgId = undefined;
-            lastStreamedText = '';
           }
         } else if (!textMsgId) {
+          // No streaming preview existed — send fresh
           await channel.sendMessage(chatJid, formatted);
         }
         outputSentToUser = true;
@@ -645,8 +680,11 @@ async function main(): Promise<void> {
       return channel.sendMessage(jid, text);
     },
     sendImage: (jid, imagePath, caption) => {
-      if (!whatsapp) throw new Error('WhatsApp not connected');
-      return whatsapp.sendImage(jid, imagePath, caption);
+      const channel = findChannel(channels, jid);
+      if (channel?.sendImage) return channel.sendImage(jid, imagePath, caption);
+      // Fallback to WhatsApp for backwards compatibility
+      if (whatsapp) return whatsapp.sendImage(jid, imagePath, caption);
+      throw new Error(`No channel with image support for JID: ${jid}`);
     },
     downloadLatestImage: (jid, savePath) => {
       if (!whatsapp) throw new Error('WhatsApp not connected');
