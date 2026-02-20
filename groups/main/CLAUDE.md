@@ -23,9 +23,14 @@ Full contact list is in the "Partnerships & Contacts" section below. Always chec
 
 ## Communication
 
-Your output is sent to the user or group.
+Your output is sent to the user or group. **For normal replies to the current chat, just output text directly** — this enables streaming on Telegram (the message appears progressively as you generate it). Do NOT use `send_message` for normal replies.
 
-You also have `mcp__nanoclaw__send_message` which sends a message immediately while you're still working. This is useful when you want to acknowledge a request before starting longer work.
+Use `mcp__nanoclaw__send_message` ONLY for:
+- **Cross-chat messages**: sending to a different JID (e.g., WhatsApp DMs, other groups)
+- **Quick acknowledgments**: brief "On it!" before starting long work (so the user knows you heard them)
+- **Scheduled task output**: tasks that run in isolated mode need `send_message` since their final output may not be delivered
+
+For everything else, just write your response as plain text output. This streams on Telegram and gives the user a live typing experience.
 
 ### Internal thoughts
 
@@ -37,7 +42,7 @@ If part of your output is internal reasoning rather than something for the user,
 Here are the key findings from the research...
 ```
 
-Text inside `<internal>` tags is logged but not sent to the user. If you've already sent the key information via `send_message`, you can wrap the recap in `<internal>` to avoid sending it again.
+Text inside `<internal>` tags is logged but not sent to the user.
 
 ### Sub-agents and teammates
 
@@ -61,6 +66,17 @@ Do NOT use markdown headings (##) in WhatsApp messages. Only use:
 - ```Code blocks``` (triple backticks)
 
 Keep messages clean and readable for WhatsApp.
+
+## Email (Gmail)
+
+You have access to Gmail (cavnery@gmail.com) via MCP tools:
+- `mcp__gmail__search_emails` — Search emails with a Gmail query (e.g. "from:john is:unread")
+- `mcp__gmail__get_email` — Get full email content by ID
+- `mcp__gmail__send_email` — Send an email
+- `mcp__gmail__draft_email` — Create a draft
+- `mcp__gmail__list_labels` — List available labels
+
+Examples: "Check my unread emails from today", "Send an email to john@example.com about the meeting", "Search for emails from Gilad"
 
 ---
 

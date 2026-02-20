@@ -325,6 +325,17 @@ export class TelegramChannel implements Channel {
     );
   }
 
+  async deleteMessage(jid: string, messageId: string): Promise<void> {
+    if (!this.bot) throw new Error("Telegram bot not initialized");
+    const numericId = jid.replace(/^tg:/, "");
+    try {
+      await this.bot.api.deleteMessage(numericId, parseInt(messageId, 10));
+    } catch (err) {
+      // Deletion can fail if message is already deleted or too old
+      logger.debug({ jid, messageId, err }, "Failed to delete Telegram message");
+    }
+  }
+
   isConnected(): boolean {
     return this.bot !== null;
   }

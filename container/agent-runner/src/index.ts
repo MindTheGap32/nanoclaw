@@ -42,6 +42,8 @@ interface ContainerOutput {
   newSessionId?: string;
   error?: string;
   isPartial?: boolean;
+  /** Stream type: 'thinking' for internal reasoning, 'text' for final output, 'tool' for tool status */
+  streamType?: 'thinking' | 'text' | 'tool';
 }
 
 interface SessionEntry {
@@ -404,10 +406,13 @@ async function runQuery(
   let messageCount = 0;
   let resultCount = 0;
 
-  // Streaming state: accumulate text deltas and emit periodically
+  // Streaming state: accumulate text/thinking deltas and emit periodically
   let streamingText = '';
   let lastStreamEmit = 0;
   let isStreamingTextBlock = false;
+  let streamingThinking = '';
+  let lastThinkingEmit = 0;
+  let isThinkingBlock = false;
 
   // Load global CLAUDE.md as additional system context (shared across all groups)
   const globalClaudeMdPath = path.join(GLOBAL_DIR, 'CLAUDE.md');
@@ -448,7 +453,8 @@ async function runQuery(
         'TeamCreate', 'TeamDelete', 'SendMessage',
         'TodoWrite', 'ToolSearch', 'Skill',
         'NotebookEdit',
-        'mcp__nanoclaw__*'
+        'mcp__nanoclaw__*',
+        'mcp__gmail__*'
       ],
       env: sdkEnv,
       permissionMode: 'bypassPermissions',
@@ -466,6 +472,10 @@ async function runQuery(
             NANOCLAW_IPC_DIR: IPC_BASE_DIR,
           },
         },
+        gmail: {
+          command: 'npx',
+          args: ['-y', '@gongrzhe/server-gmail-autoauth-mcp'],
+        },
       },
       hooks: {
         PreCompact: [{ hooks: [createPreCompactHook()] }],
@@ -482,11 +492,34 @@ async function runQuery(
       // Reset streaming state for each new assistant turn
       streamingText = '';
       isStreamingTextBlock = false;
+      streamingThinking = '';
+      isThinkingBlock = false;
     }
 
-    // Token-level streaming: capture text deltas and emit periodically
+    // Token-level streaming: capture text AND thinking deltas and emit periodically
     if (message.type === 'stream_event' && (message as any).parent_tool_use_id === null) {
       const event = (message as any).event;
+
+      // --- Thinking blocks ---
+      if (event?.type === 'content_block_start' && event?.content_block?.type === 'thinking') {
+        isThinkingBlock = true;
+        streamingThinking = '';
+        lastThinkingEmit = 0;
+      } else if (isThinkingBlock && event?.type === 'content_block_delta' && event?.delta?.type === 'thinking_delta') {
+        streamingThinking += event.delta.thinking;
+        const now = Date.now();
+        if (now - lastThinkingEmit >= 600 && streamingThinking.length > 20) {
+          writeOutput({ status: 'success', result: streamingThinking, isPartial: true, streamType: 'thinking' });
+          lastThinkingEmit = now;
+        }
+      } else if (isThinkingBlock && event?.type === 'content_block_stop') {
+        if (streamingThinking) {
+          writeOutput({ status: 'success', result: streamingThinking, isPartial: true, streamType: 'thinking' });
+        }
+        isThinkingBlock = false;
+      }
+
+      // --- Text blocks ---
       if (event?.type === 'content_block_start' && event?.content_block?.type === 'text') {
         isStreamingTextBlock = true;
         streamingText = '';
@@ -495,15 +528,21 @@ async function runQuery(
         streamingText += event.delta.text;
         const now = Date.now();
         if (now - lastStreamEmit >= 500 && streamingText.length > 10) {
-          writeOutput({ status: 'success', result: streamingText, isPartial: true });
+          writeOutput({ status: 'success', result: streamingText, isPartial: true, streamType: 'text' });
           lastStreamEmit = now;
         }
       } else if (isStreamingTextBlock && event?.type === 'content_block_stop') {
         if (streamingText) {
-          writeOutput({ status: 'success', result: streamingText, isPartial: true });
+          writeOutput({ status: 'success', result: streamingText, isPartial: true, streamType: 'text' });
         }
         isStreamingTextBlock = false;
       }
+    }
+
+    // Tool use progress: emit tool name so the user sees what's happening
+    if (message.type === 'tool_use_summary') {
+      const summary = (message as { summary: string }).summary;
+      writeOutput({ status: 'success', result: summary, isPartial: true, streamType: 'tool' });
     }
 
     if (message.type === 'system' && message.subtype === 'init') {

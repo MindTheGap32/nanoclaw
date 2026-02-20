@@ -37,6 +37,7 @@ export interface ContainerOutput {
   newSessionId?: string;
   error?: string;
   isPartial?: boolean;
+  streamType?: 'thinking' | 'text' | 'tool';
 }
 
 /**
@@ -69,6 +70,19 @@ function prepareGroupSessions(group: RegisteredGroup): string {
         CLAUDE_CODE_DISABLE_AUTO_MEMORY: '0',
       },
     }, null, 2) + '\n');
+  }
+
+  // Symlink Gmail credentials directory so Gmail MCP can find them
+  // (HOME is overridden to sessions dir, so ~/.gmail-mcp needs to exist there)
+  const realHome = process.env.HOME || '/home/user';
+  const gmailSrc = path.join(realHome, '.gmail-mcp');
+  const gmailDst = path.join(path.dirname(groupSessionsDir), '.gmail-mcp');
+  if (fs.existsSync(gmailSrc) && !fs.existsSync(gmailDst)) {
+    try {
+      fs.symlinkSync(gmailSrc, gmailDst);
+    } catch {
+      // If symlink fails (e.g. already exists as file), skip
+    }
   }
 
   // Sync skills into each group's .claude/skills/

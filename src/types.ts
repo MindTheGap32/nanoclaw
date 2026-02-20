@@ -91,6 +91,7 @@ export interface Channel {
   // Optional: streaming support. Send a message and return its ID for later editing.
   sendMessageWithId?(jid: string, text: string): Promise<string>;
   editMessage?(jid: string, messageId: string, text: string): Promise<void>;
+  deleteMessage?(jid: string, messageId: string): Promise<void>;
 }
 
 // Callback type that channels use to deliver inbound messages

@@ -178,8 +178,10 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   let hadError = false;
   let outputSentToUser = false;
 
-  // Streaming edit state: edit a single Telegram message in-place as text arrives
-  let streamingMsgId: string | undefined;
+  // Streaming state: separate messages for thinking and final text
+  let thinkingMsgId: string | undefined;
+  let lastThinkingText = '';
+  let textMsgId: string | undefined;
   let lastStreamedText = '';
 
   const output = await runAgent(group, prompt, chatJid, async (result) => {
@@ -188,55 +190,140 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
       return;
     }
 
-    if (!result.result) return;
+    if (!result.result) {
+      // Reset streaming state on empty final results (e.g. session-update markers)
+      // so the next response creates a fresh message instead of editing the old one.
+      if (!result.isPartial && channel.sendMessageWithId && channel.editMessage) {
+        textMsgId = undefined;
+        lastStreamedText = '';
+        thinkingMsgId = undefined;
+        lastThinkingText = '';
+      }
+      return;
+    }
 
     const raw = typeof result.result === 'string' ? result.result : JSON.stringify(result.result);
-    const text = raw.replace(/<internal>[\s\S]*?<\/internal>/g, '').trim();
-    logger.info({ group: group.name, partial: !!result.isPartial }, `Agent output: ${raw.slice(0, 200)}`);
-    if (!text) return;
+    logger.info({ group: group.name, partial: !!result.isPartial, streamType: result.streamType }, `Agent output: ${raw.slice(0, 200)}`);
 
-    const formatted = formatOutbound(text);
-    if (!formatted) return;
-
-    // Streaming edit support (Telegram): replace message in-place each time
+    // Streaming support (Telegram): separate messages for thinking vs final text
     if (channel.sendMessageWithId && channel.editMessage) {
-      if (result.isPartial) {
-        // Partial (assistant message text) — show it by editing in-place
-        if (streamingMsgId) {
+      const streamType = result.streamType || 'text';
+
+      if (result.isPartial && streamType === 'thinking') {
+        // Thinking stream — show in a separate "thinking" message with indicator
+        const thinkingDisplay = `💭 _${raw.slice(0, 3900)}_`;
+        if (thinkingMsgId) {
           try {
-            await channel.editMessage(chatJid, streamingMsgId, formatted);
-            lastStreamedText = formatted;
+            if (thinkingDisplay !== lastThinkingText) {
+              await channel.editMessage(chatJid, thinkingMsgId, thinkingDisplay);
+              lastThinkingText = thinkingDisplay;
+            }
           } catch {
-            // Edit failed (e.g., text same or too long) — ignore for partials
+            // Edit failed — ignore for partials
           }
         } else {
           try {
-            streamingMsgId = await channel.sendMessageWithId(chatJid, formatted);
+            thinkingMsgId = await channel.sendMessageWithId(chatJid, thinkingDisplay);
+            lastThinkingText = thinkingDisplay;
+          } catch (err) {
+            logger.warn({ err }, 'Failed to send thinking message');
+          }
+        }
+      } else if (result.isPartial && streamType === 'tool') {
+        // Tool use summary — update the thinking message with tool info
+        const toolDisplay = `🔧 ${raw.slice(0, 3900)}`;
+        if (thinkingMsgId) {
+          try {
+            await channel.editMessage(chatJid, thinkingMsgId, toolDisplay);
+            lastThinkingText = toolDisplay;
+          } catch {
+            // ignore edit failures
+          }
+        } else {
+          try {
+            thinkingMsgId = await channel.sendMessageWithId(chatJid, toolDisplay);
+            lastThinkingText = toolDisplay;
+          } catch (err) {
+            logger.warn({ err }, 'Failed to send tool message');
+          }
+        }
+      } else if (result.isPartial && streamType === 'text') {
+        // Text stream — this is the actual response being composed
+        const text = raw.replace(/<internal>[\s\S]*?<\/internal>/g, '').trim();
+        if (!text) return;
+        const formatted = formatOutbound(text);
+        if (!formatted) return;
+
+        // Delete thinking message when text starts flowing
+        if (thinkingMsgId && channel.deleteMessage) {
+          try {
+            await channel.deleteMessage(chatJid, thinkingMsgId);
+          } catch { /* ignore */ }
+          thinkingMsgId = undefined;
+          lastThinkingText = '';
+        }
+
+        if (textMsgId) {
+          try {
+            if (formatted !== lastStreamedText) {
+              await channel.editMessage(chatJid, textMsgId, formatted);
+              lastStreamedText = formatted;
+            }
+          } catch {
+            // Edit failed — ignore for partials
+          }
+        } else {
+          try {
+            textMsgId = await channel.sendMessageWithId(chatJid, formatted);
             lastStreamedText = formatted;
             outputSentToUser = true;
           } catch (err) {
-            logger.warn({ err }, 'Failed to send streaming message');
+            logger.warn({ err }, 'Failed to send streaming text message');
           }
         }
-      } else {
-        // Final result — do a final edit, or send fresh if no streaming message yet
-        if (streamingMsgId && formatted !== lastStreamedText) {
+      } else if (!result.isPartial) {
+        // Final result — clean up thinking and send/edit the final text
+        const text = raw.replace(/<internal>[\s\S]*?<\/internal>/g, '').trim();
+        if (!text) return;
+        const formatted = formatOutbound(text);
+        if (!formatted) return;
+
+        // Delete thinking message if still present
+        if (thinkingMsgId && channel.deleteMessage) {
           try {
-            await channel.editMessage(chatJid, streamingMsgId, formatted);
+            await channel.deleteMessage(chatJid, thinkingMsgId);
+          } catch { /* ignore */ }
+          thinkingMsgId = undefined;
+        }
+
+        if (textMsgId && formatted !== lastStreamedText) {
+          try {
+            await channel.editMessage(chatJid, textMsgId, formatted);
+            lastStreamedText = formatted;
           } catch {
             await channel.sendMessage(chatJid, formatted);
+            textMsgId = undefined;
+            lastStreamedText = '';
           }
-        } else if (!streamingMsgId) {
+        } else if (!textMsgId) {
           await channel.sendMessage(chatJid, formatted);
         }
-        // Reset for next result (agent teams may produce multiple)
-        streamingMsgId = undefined;
-        lastStreamedText = '';
         outputSentToUser = true;
+
+        // Reset streaming state after final result so the next response
+        // (from a piped follow-up message) creates a fresh message.
+        textMsgId = undefined;
+        lastStreamedText = '';
+        thinkingMsgId = undefined;
+        lastThinkingText = '';
       }
     } else {
       // No streaming support (WhatsApp) — skip partials, only send final results
       if (!result.isPartial) {
+        const text = raw.replace(/<internal>[\s\S]*?<\/internal>/g, '').trim();
+        if (!text) return;
+        const formatted = formatOutbound(text);
+        if (!formatted) return;
         await channel.sendMessage(chatJid, formatted);
         outputSentToUser = true;
       }
@@ -247,6 +334,13 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
 
   await channel.setTyping?.(chatJid, false);
   if (idleTimer) clearTimeout(idleTimer);
+
+  // Clean up thinking message if it's still showing after agent finishes
+  if (thinkingMsgId && channel.deleteMessage) {
+    try {
+      await channel.deleteMessage(chatJid, thinkingMsgId);
+    } catch { /* ignore */ }
+  }
 
   if (output === 'error' || hadError) {
     // If we already sent output to the user, don't roll back the cursor —

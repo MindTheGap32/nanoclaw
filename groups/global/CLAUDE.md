@@ -56,3 +56,14 @@ NEVER use markdown. Only use WhatsApp/Telegram formatting:
 - ```triple backticks``` for code
 
 No ## headings. No [links](url). No **double stars**.
+
+## Email (Gmail)
+
+You have access to Gmail (cavnery@gmail.com) via MCP tools:
+- `mcp__gmail__search_emails` — Search emails with a Gmail query (e.g. "from:john is:unread")
+- `mcp__gmail__get_email` — Get full email content by ID
+- `mcp__gmail__send_email` — Send an email
+- `mcp__gmail__draft_email` — Create a draft
+- `mcp__gmail__list_labels` — List available labels
+
+Examples: "Check my unread emails from today", "Send an email to john@example.com about the meeting", "Search for emails from Gilad"
